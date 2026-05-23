@@ -28,6 +28,7 @@ constexpr uint8_t PIN_RGB_R   = 19;
 constexpr uint8_t PIN_RGB_G   = 23;
 constexpr uint8_t PIN_RGB_B   = 18;
 constexpr uint8_t PIN_BUTTON  = 27;
+constexpr uint8_t PIN_BUZZER  = 25;   // passive piezo on servo connector
 
 // ---- F1 - Mic ----
 constexpr uint32_t MIC_SAMPLE_PERIOD_US = 125;   // ~8 kHz
@@ -51,6 +52,36 @@ constexpr uint32_t CORRELATION_HOLD_MS   = 1500;
 constexpr uint32_t SNACK_COOLDOWN_MS = 5000;  // min 5s between snacks
 constexpr uint32_t SNACK_FLASH_MS    = 500;
 constexpr uint32_t SNACK_BANNER_MS   = 2000;
+
+// ---- F6 - Buzzer (Brahms' Lullaby on bark) ----
+// Note frequencies (only the ones the song uses)
+constexpr int NOTE_G4 = 392;
+constexpr int NOTE_A4 = 440;
+constexpr int NOTE_B4 = 494;
+constexpr int NOTE_C5 = 523;
+constexpr int NOTE_D5 = 587;
+
+// Tempo: whole note = 3000ms -> quarter = 750ms = 80 BPM (lullaby pace)
+constexpr uint32_t MELODY_WHOLE_NOTE_MS = 3000;
+constexpr uint16_t MELODY_NOTE_GAP_MS   = 30;
+
+static const int BARK_MELODY_NOTES[] = {
+  NOTE_G4, NOTE_G4, NOTE_A4, NOTE_G4, NOTE_G4, NOTE_A4,
+  NOTE_G4, NOTE_B4, NOTE_C5, NOTE_C5, NOTE_B4, NOTE_D5,
+  NOTE_C5, NOTE_B4, NOTE_G4, NOTE_G4, NOTE_A4, NOTE_G4,
+  NOTE_G4, NOTE_A4, NOTE_G4, NOTE_B4, NOTE_C5, NOTE_C5,
+  NOTE_B4, NOTE_D5, NOTE_C5, NOTE_B4, NOTE_G4
+};
+// 4 = quarter, 8 = eighth, 2 = half (Arduino convention: ms = whole/value)
+static const int BARK_MELODY_DURATIONS[] = {
+  8, 8, 4, 8, 8, 4,
+  8, 8, 4, 8, 8, 4,
+  8, 8, 4, 8, 8, 4,
+  8, 8, 4, 8, 8, 4,
+  8, 8, 4, 2, 2
+};
+constexpr size_t BARK_MELODY_LEN =
+  sizeof(BARK_MELODY_NOTES) / sizeof(BARK_MELODY_NOTES[0]);
 
 // ---- F4 - Feeder ----
 constexpr uint32_t FEED_INTERVAL_MS    = 60000;
@@ -279,6 +310,34 @@ static void feeder_update(uint32_t now_ms) {
   if (g_state.feed_banner_on &&
       (now_ms - g_state.last_feed_ms) > FEED_BANNER_MS) {
     g_state.feed_banner_on = false;
+  }
+}
+
+// =============================================================
+// F6 - Buzzer (plays melody on every bark detection)
+// =============================================================
+static void buzzer_play_melody() {
+  for (size_t i = 0; i < BARK_MELODY_LEN; i++) {
+    int duration_ms = MELODY_WHOLE_NOTE_MS / BARK_MELODY_DURATIONS[i];
+    tone(PIN_BUZZER, BARK_MELODY_NOTES[i]);
+    delay(duration_ms);
+    noTone(PIN_BUZZER);
+    delay(MELODY_NOTE_GAP_MS);
+  }
+}
+
+static void buzzer_task(void* /*arg*/) {
+  Serial.println("[BUZZ] task started");
+  uint32_t last_played_bark = 0;
+  for (;;) {
+    uint32_t bark = g_state.last_bark_ms;
+    if (bark != 0 && bark != last_played_bark) {
+      Serial.printf("[BUZZ] playing arpeggio for bark @ %lu\n",
+                    (unsigned long)bark);
+      buzzer_play_melody();
+      last_played_bark = bark;
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
   }
 }
 
@@ -682,14 +741,17 @@ void setup() {
 
   pinMode(PIN_BUTTON, INPUT_PULLUP);
   pinMode(PIN_MIC, INPUT);
+  pinMode(PIN_BUZZER, OUTPUT);
+  noTone(PIN_BUZZER);
   analogReadResolution(12);
   g_state.last_feed_ms = millis();
 
   wifi_connect();
   firebase_init();
 
-  xTaskCreatePinnedToCore(mic_task,      "mic", 4096, nullptr, 1, nullptr, 1);
-  xTaskCreatePinnedToCore(firebase_task, "fb",  8192, nullptr, 1, nullptr, 0);
+  xTaskCreatePinnedToCore(mic_task,      "mic",  4096, nullptr, 1, nullptr, 1);
+  xTaskCreatePinnedToCore(buzzer_task,   "buzz", 2048, nullptr, 1, nullptr, 0);
+  xTaskCreatePinnedToCore(firebase_task, "fb",   8192, nullptr, 1, nullptr, 0);
   Serial.println("Boot complete");
 }
 
