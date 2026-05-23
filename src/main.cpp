@@ -6,6 +6,7 @@
 #include <SparkFun_APDS9960.h>
 #include <FirebaseESP32.h>
 #include <math.h>
+#include <time.h>
 
 // =============================================================
 // Totositter - BlackBoard Wisdom firmware
@@ -112,6 +113,16 @@ constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
 constexpr uint32_t FIREBASE_TASK_PERIOD_MS = 250;
 constexpr uint32_t HEARTBEAT_PERIOD_MS     = 5000;
 constexpr const char* FW_VERSION           = "0.1.0";
+
+// NTP - sync ESP32 clock to wall time so every Firebase request can carry
+// a real epoch timestamp instead of just boot-relative millis().
+constexpr const char* NTP_SERVER_1    = "pool.ntp.org";
+constexpr const char* NTP_SERVER_2    = "time.nist.gov";
+constexpr long        NTP_GMT_OFFSET  = 0;     // store UTC; format on the client
+constexpr int         NTP_DST_OFFSET  = 0;
+constexpr uint32_t    NTP_SYNC_TIMEOUT_MS = 5000;
+// time(2) earlier than this means NTP hasn't synced yet (Jan 1 2024).
+constexpr time_t      EPOCH_MIN_VALID = 1704067200;
 
 // =============================================================
 // Shared state (cross-core; volatile is acceptable at this scope)
@@ -363,6 +374,39 @@ static void wifi_connect() {
 }
 
 // =============================================================
+// NTP - wall-clock time for Firebase payloads
+// =============================================================
+static void ntp_sync() {
+  if (!wifi_ok) {
+    Serial.println("[NTP] skipped - no WiFi");
+    return;
+  }
+  configTime(NTP_GMT_OFFSET, NTP_DST_OFFSET, NTP_SERVER_1, NTP_SERVER_2);
+  uint32_t t0 = millis();
+  time_t now = 0;
+  while ((millis() - t0) < NTP_SYNC_TIMEOUT_MS) {
+    time(&now);
+    if (now >= EPOCH_MIN_VALID) break;
+    delay(200);
+  }
+  if (now >= EPOCH_MIN_VALID) {
+    Serial.printf("[NTP] synced epoch=%ld (%lums)\n",
+                  (long)now, (unsigned long)(millis() - t0));
+  } else {
+    Serial.printf("[NTP] sync FAILED after %lums - ts will be 0 until sync\n",
+                  (unsigned long)(millis() - t0));
+  }
+}
+
+// Returns current epoch seconds (UTC), or 0 if NTP has not synced yet.
+// Callers should treat 0 as "unknown" rather than a real timestamp.
+static uint32_t now_epoch() {
+  time_t now = 0;
+  time(&now);
+  return now >= EPOCH_MIN_VALID ? (uint32_t)now : 0;
+}
+
+// =============================================================
 // Firebase
 // =============================================================
 static void firebase_init() {
@@ -416,11 +460,12 @@ static void firebase_init() {
 
   // ---- Ping write to validate end-to-end connectivity ----
   FirebaseJson ping;
-  ping.set("ts",      (int)millis());
-  ping.set("fw",      FW_VERSION);
-  ping.set("ip",      WiFi.localIP().toString());
-  ping.set("rssi",    (int)WiFi.RSSI());
-  ping.set("message", "Totositter online");
+  ping.set("ts",        (int)now_epoch());
+  ping.set("uptime_ms", (int)millis());
+  ping.set("fw",        FW_VERSION);
+  ping.set("ip",        WiFi.localIP().toString());
+  ping.set("rssi",      (int)WiFi.RSSI());
+  ping.set("message",   "Totositter online");
   Serial.println("[FB] ping -> /totositter/_ping");
   uint32_t pt0 = millis();
   if (Firebase.setJSON(fbdo, "/totositter/_ping", ping)) {
@@ -449,16 +494,17 @@ static const char* current_state_label() {
   return "idle";
 }
 
-static void firebase_log_event(const char* type, FirebaseJson* extra, uint32_t ts) {
+static void firebase_log_event(const char* type, FirebaseJson* extra, uint32_t uptime_ms) {
   if (!firebase_ok || !Firebase.ready()) {
-    Serial.printf("[FB] skip %s ts=%lu (firebase_ok=%d ready=%d)\n",
-                  type, (unsigned long)ts,
+    Serial.printf("[FB] skip %s uptime=%lu (firebase_ok=%d ready=%d)\n",
+                  type, (unsigned long)uptime_ms,
                   (int)firebase_ok, (int)Firebase.ready());
     return;
   }
   FirebaseJson json;
-  json.set("type", type);
-  json.set("ts", (int)ts);
+  json.set("type",      type);
+  json.set("ts",        (int)now_epoch());
+  json.set("uptime_ms", (int)uptime_ms);
   if (extra) json.set("data", *extra);
   String path = fb_events_path();
   uint32_t t0 = millis();
@@ -489,7 +535,7 @@ static void firebase_update_state(uint32_t now_ms) {
     return;
   }
   FirebaseJson json;
-  json.set("ts",             (int)now_ms);
+  json.set("ts",             (int)now_epoch());
   json.set("uptime_ms",      (int)now_ms);
   json.set("state",          current_state_label());
   json.set("mic_rms",        (double)g_state.mic_rms);
@@ -747,6 +793,7 @@ void setup() {
   g_state.last_feed_ms = millis();
 
   wifi_connect();
+  ntp_sync();
   firebase_init();
 
   xTaskCreatePinnedToCore(mic_task,      "mic",  4096, nullptr, 1, nullptr, 1);
